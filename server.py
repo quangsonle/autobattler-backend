@@ -2,14 +2,12 @@ import os
 import time
 import math
 import glob
-import base64
 import asyncio
 from typing import Dict, Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import torch
 from model import ActorCritic
-from greedy_ai import GreedyAI
 
 ROOM_PASSWORD = os.getenv("ROOM_PASSWORD", "arena123")
 MAX_FAILED_ATTEMPTS = 5
@@ -85,39 +83,32 @@ class GameLobby:
         self.running = False
         self.loop_task: Optional[asyncio.Task] = None
         self.solo_mode = True
-        
-        self.ai_bot_type = "Greedy AI"
-        self.greedy_bot = GreedyAI('B')
+
+        # Pure Neural Model as Opponent
         self.loaded_model = None
-        self.ai_player = Player("B", "Greedy AI", 25.0, 280.0, 200.0, 299.0)
+        self.current_model_name = "No Model Loaded"
+        self.ai_player = Player("B", "Model (Not Loaded)", 25.0, 280.0, 200.0, 299.0)
 
         self.refresh_available_models()
 
     def refresh_available_models(self):
         os.makedirs("saved_models", exist_ok=True)
         files = sorted(glob.glob("saved_models/*.pt"), key=os.path.getctime, reverse=True)
-        self.available_models = ["Greedy AI"] + [os.path.basename(f) for f in files]
-        if files and self.loaded_model is None:
+        self.available_models = [os.path.basename(f) for f in files]
+        if files and (self.loaded_model is None or self.current_model_name not in self.available_models):
             self.load_ai_model(os.path.basename(files[0]))
 
     def load_ai_model(self, model_name: str):
-        if model_name == "Greedy AI":
-            self.ai_bot_type = "Greedy AI"
-            self.loaded_model = None
-            self.ai_player.username = "Greedy AI"
-            print("[Lobby] Switched to Greedy AI.")
-            return
-
         path = os.path.join("saved_models", model_name)
         if os.path.exists(path):
             try:
                 m = ActorCritic(state_dim=44)
-                m.load_state_dict(torch.load(path, map_location="cpu", weights_only=True), strict=False)
+                m.load_state_dict(torch.load(path, map_location="cpu", weights_only=False), strict=False)
                 m.eval()
                 self.loaded_model = m
-                self.ai_bot_type = model_name
-                self.ai_player.username = model_name  # Keep full name!
-                print(f"[Lobby] Successfully loaded model: {model_name}")
+                self.current_model_name = model_name
+                self.ai_player.username = model_name
+                print(f"[Lobby] Loaded Neural Model for Player B: {model_name}")
             except Exception as e:
                 print(f"[Lobby] Model load error: {e}")
 
@@ -191,7 +182,7 @@ class GameLobby:
             pB_y = p_list[1].y
             pB_score = p_list[1].score
         else:
-            pB_name = self.ai_player.username
+            pB_name = self.current_model_name
             pB_x = self.ai_player.x
             pB_y = self.ai_player.y
             pB_score = self.ai_player.score
@@ -232,20 +223,15 @@ class GameLobby:
                 pB.move()
             else:
                 pB = self.ai_player
+                # Pure Neural Model Inference
                 if self.loaded_model:
                     feat_b = self.get_canonical_features('B')
                     tb = torch.tensor(feat_b, dtype=torch.float32).unsqueeze(0)
                     move_b = self.loaded_model.act(tb, deterministic=False)[0]
                     pB.move(move_b)
                 else:
-                    class MockEngine:
-                        def __init__(self, pA, pB, bullets):
-                            self.player_a = pA
-                            self.player_b = pB
-                            self.bullets = bullets
-                    mock_eng = MockEngine(pA, pB, self.bullets)
-                    move_b = self.greedy_bot.get_action(mock_eng)
-                    pB.move(move_b)
+                    # Gentle patrol if no model loaded yet
+                    pB.move(1 if pB.x > 35 else 2)
 
             pA.tick_cooldown()
             pB.tick_cooldown()
@@ -278,6 +264,30 @@ class GameLobby:
             await asyncio.sleep(1.0 / TPS)
 
 lobby = GameLobby()
+
+# --- FAST BINARY HTTP UPLOAD ENDPOINT (NO 128KB LIMIT!) ---
+@app.post("/api/upload_model")
+async def upload_model_binary(request: Request):
+    filename = request.headers.get("X-Filename", "uploaded_model.pt")
+    filename = os.path.basename(filename)
+    data = await request.body()
+
+    os.makedirs("saved_models", exist_ok=True)
+    save_path = os.path.join("saved_models", filename)
+    with open(save_path, "wb") as f:
+        f.write(data)
+
+    lobby.refresh_available_models()
+    lobby.load_ai_model(filename)
+
+    await lobby.broadcast({
+        "type": "models_updated",
+        "models": lobby.available_models,
+        "selected_model": filename
+    })
+    await lobby.broadcast(lobby.get_current_state())
+
+    return {"status": "ok", "filename": filename, "models": lobby.available_models}
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -318,7 +328,7 @@ async def websocket_endpoint(ws: WebSocket):
             "slot": assigned_id,
             "username": username,
             "models": lobby.available_models,
-            "selected_model": lobby.ai_bot_type
+            "selected_model": lobby.current_model_name
         })
 
         await lobby.broadcast(lobby.get_current_state())
@@ -333,30 +343,10 @@ async def websocket_endpoint(ws: WebSocket):
             elif mtype == "select_model":
                 m_name = msg.get("model")
                 lobby.load_ai_model(m_name)
-                await ws.send_json({
-                    "type": "model_ready",
-                    "model": lobby.ai_bot_type,
-                    "message": f"Opponent set to: {lobby.ai_bot_type}"
-                })
-                await lobby.broadcast(lobby.get_current_state())
-
-            elif mtype == "upload_model":
-                filename = os.path.basename(msg.get("filename", "custom_model.pt"))
-                file_bytes = base64.b64decode(msg.get("data"))
-                os.makedirs("saved_models", exist_ok=True)
-                save_dest = os.path.join("saved_models", filename)
-                with open(save_dest, "wb") as f:
-                    f.write(file_bytes)
-                
-                lobby.refresh_available_models()
-                lobby.load_ai_model(filename)
-                
-                # Send confirmation immediately!
-                await ws.send_json({
-                    "type": "upload_success",
+                await lobby.broadcast({
+                    "type": "models_updated",
                     "models": lobby.available_models,
-                    "selected_model": filename,
-                    "message": f"Upload Complete! Loaded: {filename}"
+                    "selected_model": lobby.current_model_name
                 })
                 await lobby.broadcast(lobby.get_current_state())
 

@@ -4,20 +4,12 @@ import time
 import math
 import glob
 import asyncio
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional
 
-sys.path.insert(0, os.path.abspath("."))
-sys.path.insert(0, os.path.abspath(".."))
-
-from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-import torch
-import torch.nn as nn
-from torch.distributions import Categorical
 
 ROOM_PASSWORD = os.getenv("ROOM_PASSWORD", "arena123")
-MAX_FAILED_ATTEMPTS = 5
-LOCKOUT_DURATION = 900
 
 MAP_WIDTH = 50.0
 MAP_HEIGHT = 300.0
@@ -27,40 +19,30 @@ BULLET_SPEED = 50.0 / TPS
 FIRE_COOLDOWN = int(0.5 * TPS)
 HITBOX_RADIUS = 1.6
 
-# Self-contained Neural Network (No external model.py required on Render)
-class ActorCritic(nn.Module):
-    def __init__(self, state_dim=44):
-        super().__init__()
-        self.actor_backbone = nn.Sequential(
-            nn.Linear(state_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU()
-        )
-        self.move_head = nn.Linear(128, 5)
+# --- Self-Contained Neural Model ---
+try:
+    import torch
+    import torch.nn as nn
+    from torch.distributions import Categorical
 
-        self.critic = nn.Sequential(
-            nn.Linear(state_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1)
-        )
+    class ActorCritic(nn.Module):
+        def __init__(self, state_dim=44):
+            super().__init__()
+            self.actor_backbone = nn.Sequential(
+                nn.Linear(state_dim, 128), nn.ReLU(),
+                nn.Linear(128, 128), nn.ReLU()
+            )
+            self.move_head = nn.Linear(128, 5)
 
-    def forward(self, state):
-        feat = self.actor_backbone(state)
-        move_logits = torch.clamp(self.move_head(feat), -10.0, 10.0)
-        value = self.critic(state)
-        return move_logits, value
+        def forward(self, state):
+            return torch.clamp(self.move_head(self.actor_backbone(state)), -10.0, 10.0)
 
-    def act(self, state_tensor, deterministic=False):
-        with torch.no_grad():
-            move_logits, value = self.forward(state_tensor)
-            if deterministic:
-                move_act = torch.argmax(move_logits, dim=-1).item()
-            else:
-                move_act = Categorical(logits=move_logits).sample().item()
-            return move_act, value.squeeze().item()
+        def act(self, state_tensor):
+            with torch.no_grad():
+                logits = self.forward(state_tensor)
+                return Categorical(logits=logits).sample().item()
+except Exception:
+    ActorCritic = None
 
 app = FastAPI()
 app.add_middleware(
@@ -71,265 +53,205 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-failed_attempts: Dict[str, Dict] = {}
-
-def find_models_directory() -> str:
-    candidates = ["saved_models", "../saved_models", "../../saved_models"]
-    for c in candidates:
-        if os.path.isdir(c):
-            return os.path.abspath(c)
-    os.makedirs("saved_models", exist_ok=True)
-    return os.path.abspath("saved_models")
-
-class Player:
-    def __init__(self, pid: str, username: str, x: float, y: float, y_min: float, y_max: float):
-        self.pid = pid
+class Client:
+    def __init__(self, ws: WebSocket, username: str):
+        self.ws = ws
         self.username = username
-        self.x = x
-        self.y = y
-        self.y_min = y_min
-        self.y_max = y_max
-        self.score = 0
-        self.cooldown = 0
         self.keys = {"left": False, "right": False, "up": False, "down": False}
 
-    def move(self, move_act: Optional[int] = None):
-        dx, dy = 0.0, 0.0
-        if move_act is not None:
-            if move_act == 1: dx = -1.0
-            elif move_act == 2: dx = 1.0
-            elif move_act == 3: dy = 1.0 if self.pid == 'A' else -1.0
-            elif move_act == 4: dy = -1.0 if self.pid == 'A' else 1.0
-        else:
-            if self.keys["left"]: dx -= 1.0
-            if self.keys["right"]: dx += 1.0
-            if self.keys["up"]: dy -= 1.0
-            if self.keys["down"]: dy += 1.0
-
-        self.x = max(0.0, min(MAP_WIDTH - 1.0, self.x + dx * PLAYER_SPEED))
-        self.y = max(self.y_min, min(self.y_max, self.y + dy * PLAYER_SPEED))
-
-    def tick_cooldown(self):
-        if self.cooldown > 0:
-            self.cooldown -= 1
-
-class Bullet:
-    def __init__(self, x: float, y: float, vy: float, owner: str):
-        self.x = x
-        self.y = y
-        self.vx = 0.0
-        self.vy = vy
-        self.owner = owner
-
-    def update(self) -> bool:
-        self.y += self.vy
-        return 0 <= self.y < MAP_HEIGHT
-
-class GameLobby:
+class GameServer:
     def __init__(self):
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.models_dir = os.path.join(base_dir, "saved_models")
-        os.makedirs(self.models_dir, exist_ok=True)
-
-        # Dedicated Slots: Slot A and Slot B
-        self.slot_a: Optional[Tuple[WebSocket, Player]] = None
-        self.slot_b: Optional[Tuple[WebSocket, Player]] = None
-
-        self.bullets = []
+        self.p1: Optional[Client] = None
+        self.p2: Optional[Client] = None
         self.running = False
+        self.bullets = []
         self.loop_task: Optional[asyncio.Task] = None
 
-        self.loaded_model = None
-        self.current_model_name = "imitation_model2.pt"
-        self.ai_player = Player("B", "imitation_model2.pt", 25.0, 280.0, 200.0, 299.0)
+        # Coordinates
+        self.pA_x = 25.0
+        self.pA_y = 20.0
+        self.pA_score = 0
+        self.pA_cooldown = 0
 
-        self.refresh_available_models()
+        self.pB_x = 25.0
+        self.pB_y = 280.0
+        self.pB_score = 0
+        self.pB_cooldown = 0
 
-    def refresh_available_models(self):
-        files = sorted(glob.glob(os.path.join(self.models_dir, "*.pt")), key=os.path.getctime, reverse=True)
-        self.available_models = [os.path.basename(f) for f in files]
-        if self.available_models:
-            self.load_ai_model(self.available_models[0])
+        # AI Model
+        self.ai_model = None
+        self.ai_name = "Reflex Bot"
+        self.init_ai()
 
-    def load_ai_model(self, model_name: str) -> Tuple[bool, str]:
-        path = os.path.join(self.models_dir, model_name)
-        if not os.path.exists(path):
-            return False, f"File {model_name} not found."
-
-        try:
-            m = ActorCritic(state_dim=44)
+    def init_ai(self):
+        if ActorCritic is None:
+            return
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        models = sorted(glob.glob(os.path.join(base_dir, "saved_models", "*.pt")), key=os.path.getctime, reverse=True)
+        if models:
             try:
-                state_dict = torch.load(path, map_location="cpu", weights_only=False)
-            except Exception:
-                state_dict = torch.load(path, map_location="cpu")
-
-            m.load_state_dict(state_dict, strict=False)
-            m.eval()
-            self.loaded_model = m
-            self.current_model_name = model_name
-            self.ai_player.username = model_name
-            print(f"[Lobby] Loaded Neural Model: {model_name}")
-            return True, ""
-        except Exception as e:
-            return False, str(e)
-
-    def get_canonical_features(self, pid: str) -> list:
-        is_a = (pid == 'A')
-        pA = self.slot_a[1] if self.slot_a else Player("A", "", 25, 20, 0, 99)
-        pB = self.slot_b[1] if self.slot_b else self.ai_player
-
-        self_p = pA if is_a else pB
-        rival_p = pB if is_a else pA
-
-        def to_canonical(x, y, vy):
-            return (x, y, vy) if is_a else (x, MAP_HEIGHT - 1.0 - y, -vy)
-
-        sx, sy, _ = to_canonical(self_p.x, self_p.y, 0)
-        rx, ry, _ = to_canonical(rival_p.x, rival_p.y, 0)
-
-        features = [sx / MAP_WIDTH, sy / 100.0, self_p.cooldown / float(FIRE_COOLDOWN),
-                    (rx - sx) / MAP_WIDTH, (ry - sy) / MAP_HEIGHT]
-
-        enemy_bullets = []
-        own_bullets = []
-        for b in self.bullets:
-            bx, by, bvy = to_canonical(b.x, b.y, b.vy)
-            dist = math.hypot(bx - sx, by - sy)
-            if b.owner != pid:
-                enemy_bullets.append((dist, bx, by, bvy))
-            else:
-                own_bullets.append((dist, bx, by))
-
-        enemy_bullets.sort(key=lambda item: item[0])
-        for i in range(5):
-            if i < len(enemy_bullets):
-                _, bx, by, bvy = enemy_bullets[i]
-                t_hit = (by - sy) / (-bvy) if bvy < -1e-4 else 10.0
-                features.extend([(bx - sx) / MAP_WIDTH, (by - sy) / 100.0, 0.0, bvy / BULLET_SPEED,
-                                 max(0.0, min(5.0, t_hit)) / 5.0, 1.0])
-            else:
-                features.extend([0.0] * 6)
-
-        own_bullets.sort(key=lambda item: item[0])
-        for i in range(3):
-            if i < len(own_bullets):
-                _, bx, by = own_bullets[i]
-                features.extend([(bx - rx) / MAP_WIDTH, (by - ry) / MAP_HEIGHT, 1.0])
-            else:
-                features.extend([0.0] * 3)
-
-        return features
+                m = ActorCritic(state_dim=44)
+                m.load_state_dict(torch.load(models[0], map_location="cpu", weights_only=False), strict=False)
+                m.eval()
+                self.ai_model = m
+                self.ai_name = os.path.basename(models[0])
+                print(f"[AI] Loaded neural model: {self.ai_name}")
+            except Exception as e:
+                print(f"[AI] Model load error: {e}")
 
     def reset_positions_and_scores(self):
+        self.pA_x, self.pA_y = 25.0, 20.0
+        self.pB_x, self.pB_y = 25.0, 280.0
+        self.pA_score = 0
+        self.pB_score = 0
+        self.pA_cooldown = 0
+        self.pB_cooldown = 0
         self.bullets.clear()
-        if self.slot_a:
-            self.slot_a[1].x, self.slot_a[1].y = 25.0, 20.0
-            self.slot_a[1].cooldown = 0
-            self.slot_a[1].score = 0
-        if self.slot_b:
-            self.slot_b[1].x, self.slot_b[1].y = 25.0, 280.0
-            self.slot_b[1].cooldown = 0
-            self.slot_b[1].score = 0
-        self.ai_player.x, self.ai_player.y = 25.0, 280.0
-        self.ai_player.cooldown = 0
-        self.ai_player.score = 0
 
-    def get_current_state(self):
-        num_humans = (1 if self.slot_a else 0) + (1 if self.slot_b else 0)
+    def get_state_payload(self):
+        num_humans = (1 if self.p1 else 0) + (1 if self.p2 else 0)
         is_pvp = (num_humans == 2)
 
-        pA = self.slot_a[1] if self.slot_a else Player("A", "Waiting...", 25.0, 20.0, 0, 99)
-        pB = self.slot_b[1] if self.slot_b else self.ai_player
+        name_a = self.p1.username if self.p1 else "Waiting..."
+        name_b = self.p2.username if self.p2 else self.ai_name
 
         return {
             "type": "state",
             "is_pvp": is_pvp,
             "num_humans": num_humans,
             "running": self.running,
-            "player_a": {"x": pA.x, "y": pA.y, "score": pA.score, "name": pA.username},
-            "player_b": {"x": pB.x, "y": pB.y, "score": pB.score, "name": pB.username},
-            "bullets": [{"x": b.x, "y": b.y, "owner": b.owner} for b in self.bullets]
+            "player_a": {"name": name_a, "x": self.pA_x, "y": self.pA_y, "score": self.pA_score},
+            "player_b": {"name": name_b, "x": self.pB_x, "y": self.pB_y, "score": self.pB_score},
+            "bullets": [{"x": b["x"], "y": b["y"], "owner": b["owner"]} for b in self.bullets]
         }
 
-    async def broadcast(self, data: dict):
-        targets = []
-        if self.slot_a: targets.append(self.slot_a[0])
-        if self.slot_b: targets.append(self.slot_b[0])
-
+    async def broadcast(self):
+        payload = self.get_state_payload()
         dead = []
-        for ws in targets:
-            try:
-                await ws.send_json(data)
-            except Exception:
-                dead.append(ws)
+        for client in [self.p1, self.p2]:
+            if client:
+                try:
+                    await client.ws.send_json(payload)
+                except Exception:
+                    dead.append(client.ws)
         for ws in dead:
-            await self.disconnect(ws)
+            await self.handle_disconnect(ws)
 
-    async def disconnect(self, ws: WebSocket):
-        if self.slot_a and self.slot_a[0] == ws:
-            print(f"[Lobby] Slot A ({self.slot_a[1].username}) left.")
-            self.slot_a = None
-        elif self.slot_b and self.slot_b[0] == ws:
-            print(f"[Lobby] Slot B ({self.slot_b[1].username}) left.")
-            self.slot_b = None
+    async def handle_disconnect(self, ws: WebSocket):
+        if self.p1 and self.p1.ws == ws:
+            print(f"[Server] Player 1 ({self.p1.username}) left.")
+            # Promote Player 2 to Player 1 if present
+            self.p1 = self.p2
+            self.p2 = None
+        elif self.p2 and self.p2.ws == ws:
+            print(f"[Server] Player 2 ({self.p2.username}) left.")
+            self.p2 = None
 
         self.running = False
         self.reset_positions_and_scores()
-        await self.broadcast(self.get_current_state())
+        await self.broadcast()
 
-    async def game_tick(self):
+    def get_ai_features(self):
+        sx, sy = self.pB_x, MAP_HEIGHT - 1.0 - self.pB_y
+        rx, ry = self.pA_x, MAP_HEIGHT - 1.0 - self.pA_y
+        features = [sx / MAP_WIDTH, sy / 100.0, self.pB_cooldown / float(FIRE_COOLDOWN),
+                    (rx - sx) / MAP_WIDTH, (ry - sy) / MAP_HEIGHT]
+        threats = []
+        for b in self.bullets:
+            if b["owner"] == "A":
+                bx, by = b["x"], MAP_HEIGHT - 1.0 - b["y"]
+                threats.append((math.hypot(bx - sx, by - sy), bx, by))
+        threats.sort(key=lambda item: item[0])
+        for i in range(5):
+            if i < len(threats):
+                _, bx, by = threats[i]
+                features.extend([(bx - sx) / MAP_WIDTH, (by - sy) / 100.0, 0.0, -1.0, 0.5, 1.0])
+            else:
+                features.extend([0.0] * 6)
+        features.extend([0.0] * 9)
+        return features
+
+    async def game_loop(self):
         while self.running:
-            if not self.slot_a and not self.slot_b:
+            if not self.p1:
                 break
 
-            pA = self.slot_a[1] if self.slot_a else self.ai_player
-            
-            # PVP DUEL
-            if self.slot_a and self.slot_b:
-                pB = self.slot_b[1]
-                pB.move()  # Player B moves with keyboard
-            # SOLO VS MODEL
+            # 1. Move Player A (Top Human) - STRICTLY CLAMPED TO TOP HALF [0, 99]
+            keys_a = self.p1.keys
+            dx_a, dy_a = 0.0, 0.0
+            if keys_a["left"]: dx_a -= 1.0
+            if keys_a["right"]: dx_a += 1.0
+            if keys_a["up"]: dy_a -= 1.0
+            if keys_a["down"]: dy_a += 1.0
+            self.pA_x = max(0.0, min(MAP_WIDTH - 1.0, self.pA_x + dx_a * PLAYER_SPEED))
+            self.pA_y = max(0.0, min(99.0, self.pA_y + dy_a * PLAYER_SPEED))
+
+            # 2. Move Player B - STRICTLY CLAMPED TO BOTTOM HALF [200, 299]
+            dx_b, dy_b = 0.0, 0.0
+            if self.p2:
+                # 2-Player Human PVP
+                keys_b = self.p2.keys
+                if keys_b["left"]: dx_b -= 1.0
+                if keys_b["right"]: dx_b += 1.0
+                if keys_b["up"]: dy_b -= 1.0
+                if keys_b["down"]: dy_b += 1.0
             else:
-                pB = self.ai_player
-                if self.loaded_model:
-                    feat_b = self.get_canonical_features('B')
-                    tb = torch.tensor(feat_b, dtype=torch.float32).unsqueeze(0)
-                    move_b = self.loaded_model.act(tb, deterministic=False)[0]
-                    pB.move(move_b)
+                # Solo AI
+                if self.ai_model:
+                    try:
+                        tb = torch.tensor(self.get_ai_features(), dtype=torch.float32).unsqueeze(0)
+                        move_b = self.ai_model.act(tb)
+                        if move_b == 1: dx_b = -1.0
+                        elif move_b == 2: dx_b = 1.0
+                        elif move_b == 3: dy_b = -1.0
+                        elif move_b == 4: dy_b = 1.0
+                    except Exception:
+                        dx_b = 1.0 if self.pB_x < 25.0 else -1.0
                 else:
-                    pB.move(0)
+                    # Smart evasive patrol if no model
+                    incoming = [b for b in self.bullets if b["owner"] == "A" and b["y"] > 150]
+                    if incoming and abs(incoming[0]["x"] - self.pB_x) < 5.0:
+                        dx_b = 1.0 if incoming[0]["x"] <= self.pB_x else -1.0
+                    else:
+                        dx_b = 1.0 if self.pB_x < 15.0 else (-1.0 if self.pB_x > 35.0 else 0.0)
 
-            pA.tick_cooldown()
-            pB.tick_cooldown()
-            pA.move()  # Player A moves with keyboard
+            self.pB_x = max(0.0, min(MAP_WIDTH - 1.0, self.pB_x + dx_b * PLAYER_SPEED))
+            self.pB_y = max(200.0, min(299.0, self.pB_y + dy_b * PLAYER_SPEED))
 
-            # Auto-fire straight on cooldown
-            if pA.cooldown == 0:
-                self.bullets.append(Bullet(pA.x, pA.y, BULLET_SPEED, "A"))
-                pA.cooldown = FIRE_COOLDOWN
-            if pB.cooldown == 0:
-                self.bullets.append(Bullet(pB.x, pB.y, -BULLET_SPEED, "B"))
-                pB.cooldown = FIRE_COOLDOWN
+            # 3. Auto-fire on cooldown
+            if self.pA_cooldown > 0:
+                self.pA_cooldown -= 1
+            else:
+                self.bullets.append({"x": self.pA_x, "y": self.pA_y, "vy": BULLET_SPEED, "owner": "A"})
+                self.pA_cooldown = FIRE_COOLDOWN
 
+            if self.pB_cooldown > 0:
+                self.pB_cooldown -= 1
+            else:
+                self.bullets.append({"x": self.pB_x, "y": self.pB_y, "vy": -BULLET_SPEED, "owner": "B"})
+                self.pB_cooldown = FIRE_COOLDOWN
+
+            # 4. Bullet physics & collisions
             surviving = []
             for b in self.bullets:
-                if not b.update():
+                b["y"] += b["vy"]
+                if not (0 <= b["y"] < MAP_HEIGHT):
                     continue
 
-                if b.owner == "B" and math.hypot(b.x - pA.x, b.y - pA.y) < HITBOX_RADIUS:
-                    pB.score += 1
+                if b["owner"] == "B" and math.hypot(b["x"] - self.pA_x, b["y"] - self.pA_y) < HITBOX_RADIUS:
+                    self.pB_score += 1
                     continue
-                if b.owner == "A" and math.hypot(b.x - pB.x, b.y - pB.y) < HITBOX_RADIUS:
-                    pA.score += 1
+                if b["owner"] == "A" and math.hypot(b["x"] - self.pB_x, b["y"] - self.pB_y) < HITBOX_RADIUS:
+                    self.pA_score += 1
                     continue
 
                 surviving.append(b)
 
             self.bullets = surviving
-            await self.broadcast(self.get_current_state())
+            await self.broadcast()
             await asyncio.sleep(1.0 / TPS)
 
-lobby = GameLobby()
+server = GameServer()
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -345,36 +267,27 @@ async def websocket_endpoint(ws: WebSocket):
             await ws.close(code=4002)
             return
 
-        # Assign Slot A first; if taken, assign Slot B!
-        if lobby.slot_a is None:
-            assigned_slot = "A"
-            player = Player("A", username, 25.0, 20.0, 0.0, 99.0)
-            lobby.slot_a = (ws, player)
-        elif lobby.slot_b is None:
-            assigned_slot = "B"
-            player = Player("B", username, 25.0, 280.0, 200.0, 299.0)
-            lobby.slot_b = (ws, player)
+        # Slot Assignment
+        if server.p1 is None:
+            server.p1 = Client(ws, username)
+            slot = "A"
+        elif server.p2 is None:
+            # If same name typed, make it distinct
+            if server.p1.username == username:
+                username = f"{username}_2"
+            server.p2 = Client(ws, username)
+            slot = "B"
+            # NEW CHALLENGER TAKEOVER: Halt any running solo match and reset to 0-0
+            server.running = False
+            server.reset_positions_and_scores()
+            print(f"[Server] Challenger {username} entered! Switched to 2-Player Mode.")
         else:
-            await ws.send_json({"type": "error", "message": "Lobby is full (Maximum 2 players)."})
+            await ws.send_json({"type": "error", "message": "Room is full (Maximum 2 players)."})
             await ws.close(code=4001)
             return
 
-        print(f"[Lobby] Assigned {username} to Slot {assigned_slot}. (Slot A: {bool(lobby.slot_a)}, Slot B: {bool(lobby.slot_b)})")
-
-        # Stop match and reset scores cleanly whenever someone joins
-        lobby.running = False
-        lobby.reset_positions_and_scores()
-
-        await ws.send_json({
-            "type": "init",
-            "slot": assigned_slot,
-            "username": username,
-            "models": lobby.available_models,
-            "selected_model": lobby.current_model_name
-        })
-
-        # Broadcast state so BOTH screens update immediately!
-        await lobby.broadcast(lobby.get_current_state())
+        await ws.send_json({"type": "init", "slot": slot, "username": username})
+        await server.broadcast()
 
         while True:
             msg = await ws.receive_json()
@@ -383,36 +296,32 @@ async def websocket_endpoint(ws: WebSocket):
             if mtype == "ping":
                 await ws.send_json({"type": "pong"})
 
-            elif mtype == "select_model":
-                m_name = msg.get("model")
-                lobby.load_ai_model(m_name)
-                await lobby.broadcast(lobby.get_current_state())
+            elif mtype == "start":
+                server.running = True
+                server.reset_positions_and_scores()
+                if server.loop_task is None or server.loop_task.done():
+                    server.loop_task = asyncio.create_task(server.game_loop())
 
-            # Start Match (Works for both 2-Player Duel and Solo)
-            elif mtype in ["start_match", "start_solo", "start_duel"]:
-                lobby.running = True
-                lobby.reset_positions_and_scores()
-                if lobby.loop_task is None or lobby.loop_task.done():
-                    lobby.loop_task = asyncio.create_task(lobby.game_tick())
-
-            elif mtype == "stop_match":
-                lobby.running = False
-                lobby.reset_positions_and_scores()
-                await lobby.broadcast(lobby.get_current_state())
+            elif mtype == "stop":
+                server.running = False
+                server.reset_positions_and_scores()
+                await server.broadcast()
 
             elif mtype == "keys":
-                player.keys = {
-                    "left": bool(msg.get("left", False)),
-                    "right": bool(msg.get("right", False)),
-                    "up": bool(msg.get("up", False)),
-                    "down": bool(msg.get("down", False))
-                }
+                client = server.p1 if ws == (server.p1.ws if server.p1 else None) else server.p2
+                if client:
+                    client.keys = {
+                        "left": bool(msg.get("left", False)),
+                        "right": bool(msg.get("right", False)),
+                        "up": bool(msg.get("up", False)),
+                        "down": bool(msg.get("down", False))
+                    }
 
     except WebSocketDisconnect:
-        await lobby.disconnect(ws)
+        await server.handle_disconnect(ws)
     except Exception as e:
-        print(f"[Error] {e}")
-        await lobby.disconnect(ws)
+        print(f"[Server Error] {e}")
+        await server.handle_disconnect(ws)
 
 if __name__ == "__main__":
     import uvicorn

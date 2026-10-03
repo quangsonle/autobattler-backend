@@ -6,13 +6,11 @@ import glob
 import asyncio
 from typing import Dict, Optional, Tuple
 
-sys.path.insert(0, os.path.abspath("."))
-sys.path.insert(0, os.path.abspath(".."))
-
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import torch
-from model import ActorCritic
+import torch.nn as nn
+from torch.distributions import Categorical
 
 ROOM_PASSWORD = os.getenv("ROOM_PASSWORD", "arena123")
 MAX_FAILED_ATTEMPTS = 5
@@ -26,6 +24,41 @@ BULLET_SPEED = 50.0 / TPS
 FIRE_COOLDOWN = int(0.5 * TPS)
 HITBOX_RADIUS = 1.6
 
+# --- SELF-CONTAINED NEURAL NETWORK (NO MODEL.PY NEEDED!) ---
+class ActorCritic(nn.Module):
+    def __init__(self, state_dim=44):
+        super().__init__()
+        self.actor_backbone = nn.Sequential(
+            nn.Linear(state_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU()
+        )
+        self.move_head = nn.Linear(128, 5)
+
+        self.critic = nn.Sequential(
+            nn.Linear(state_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, state):
+        feat = self.actor_backbone(state)
+        move_logits = torch.clamp(self.move_head(feat), -10.0, 10.0)
+        value = self.critic(state)
+        return move_logits, value
+
+    def act(self, state_tensor, deterministic=False):
+        with torch.no_grad():
+            move_logits, value = self.forward(state_tensor)
+            if deterministic:
+                move_act = torch.argmax(move_logits, dim=-1).item()
+            else:
+                move_act = Categorical(logits=move_logits).sample().item()
+            return move_act, value.squeeze().item()
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -36,14 +69,6 @@ app.add_middleware(
 )
 
 failed_attempts: Dict[str, Dict] = {}
-
-def find_models_directory() -> str:
-    candidates = ["saved_models", "../saved_models", "../../saved_models"]
-    for c in candidates:
-        if os.path.isdir(c):
-            return os.path.abspath(c)
-    os.makedirs("saved_models", exist_ok=True)
-    return os.path.abspath("saved_models")
 
 class Player:
     def __init__(self, pid: str, username: str, x: float, y: float, y_min: float, y_max: float):
@@ -91,7 +116,11 @@ class Bullet:
 
 class GameLobby:
     def __init__(self):
-        self.models_dir = find_models_directory()
+        # Look for saved_models in current repo root
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.models_dir = os.path.join(base_dir, "saved_models")
+        os.makedirs(self.models_dir, exist_ok=True)
+
         self.active_connections: Dict[WebSocket, Player] = {}
         self.bullets = []
         self.running = False
@@ -100,18 +129,17 @@ class GameLobby:
 
         self.loaded_model = None
         self.current_model_name = "Waiting for Model..."
-        self.ai_player = Player("B", "Trained AI Model", 25.0, 280.0, 200.0, 299.0)
+        self.ai_player = Player("B", "Model", 25.0, 280.0, 200.0, 299.0)
 
         self.refresh_available_models()
 
     def refresh_available_models(self):
-        self.models_dir = find_models_directory()
         files = sorted(glob.glob(os.path.join(self.models_dir, "*.pt")), key=os.path.getctime, reverse=True)
         self.available_models = [os.path.basename(f) for f in files]
-        
+        print(f"[Lobby] Found {len(self.available_models)} models in {self.models_dir}: {self.available_models}")
+
         if self.available_models:
-            if self.loaded_model is None or self.current_model_name not in self.available_models:
-                self.load_ai_model(self.available_models[0])
+            self.load_ai_model(self.available_models[0])
 
     def load_ai_model(self, model_name: str) -> Tuple[bool, str]:
         path = os.path.join(self.models_dir, model_name)
@@ -130,10 +158,10 @@ class GameLobby:
             self.loaded_model = m
             self.current_model_name = model_name
             self.ai_player.username = model_name
-            print(f"[Lobby] Loaded Neural Model: {model_name}")
+            print(f"[Lobby] Successfully loaded AI Model: {model_name}")
             return True, ""
         except Exception as e:
-            print(f"[Lobby] Failed to load {model_name}: {e}")
+            print(f"[Lobby] Failed to load model {model_name}: {e}")
             return False, str(e)
 
     def get_canonical_features(self, pid: str) -> list:
@@ -247,7 +275,6 @@ class GameLobby:
                 pB.move()
             else:
                 pB = self.ai_player
-                # Pure Neural Network Inference
                 if self.loaded_model:
                     feat_b = self.get_canonical_features('B')
                     tb = torch.tensor(feat_b, dtype=torch.float32).unsqueeze(0)
@@ -287,7 +314,6 @@ class GameLobby:
 
 lobby = GameLobby()
 
-# HTTP Upload Endpoint
 @app.post("/api/upload_model")
 async def upload_model_binary(request: Request, filename: Optional[str] = None):
     try:
@@ -305,7 +331,7 @@ async def upload_model_binary(request: Request, filename: Optional[str] = None):
         lobby.refresh_available_models()
         success, err = lobby.load_ai_model(name)
         if not success:
-            return Response(content=f"Saved file, but PyTorch load failed: {err}", status_code=500)
+            return Response(content=f"Saved file, but load failed: {err}", status_code=500)
 
         await lobby.broadcast({
             "type": "models_updated",
@@ -350,6 +376,7 @@ async def websocket_endpoint(ws: WebSocket):
         lobby.active_connections[ws] = player
         lobby.refresh_available_models()
 
+        # Send models list & active model immediately
         await ws.send_json({
             "type": "init",
             "slot": assigned_id,

@@ -1,10 +1,16 @@
 import os
+import sys
 import time
 import math
 import glob
 import asyncio
-from typing import Dict, Optional
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from typing import Dict, Optional, Tuple
+
+# Ensure parent directory is in sys.path so model.py can always be imported
+sys.path.insert(0, os.path.abspath("."))
+sys.path.insert(0, os.path.abspath(".."))
+
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import torch
 from model import ActorCritic
@@ -25,12 +31,21 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 failed_attempts: Dict[str, Dict] = {}
+
+def find_models_directory() -> str:
+    """Finds saved_models folder whether running from root or web_server/"""
+    candidates = ["saved_models", "../saved_models", "../../saved_models"]
+    for c in candidates:
+        if os.path.isdir(c):
+            return os.path.abspath(c)
+    os.makedirs("saved_models", exist_ok=True)
+    return os.path.abspath("saved_models")
 
 class Player:
     def __init__(self, pid: str, username: str, x: float, y: float, y_min: float, y_max: float):
@@ -78,39 +93,51 @@ class Bullet:
 
 class GameLobby:
     def __init__(self):
+        self.models_dir = find_models_directory()
         self.active_connections: Dict[WebSocket, Player] = {}
         self.bullets = []
         self.running = False
         self.loop_task: Optional[asyncio.Task] = None
         self.solo_mode = True
 
-        # Pure Neural Model as Opponent
         self.loaded_model = None
-        self.current_model_name = "No Model Loaded"
-        self.ai_player = Player("B", "Model (Not Loaded)", 25.0, 280.0, 200.0, 299.0)
+        self.current_model_name = "No Model Found"
+        self.ai_player = Player("B", "Model", 25.0, 280.0, 200.0, 299.0)
 
         self.refresh_available_models()
 
     def refresh_available_models(self):
-        os.makedirs("saved_models", exist_ok=True)
-        files = sorted(glob.glob("saved_models/*.pt"), key=os.path.getctime, reverse=True)
+        self.models_dir = find_models_directory()
+        files = sorted(glob.glob(os.path.join(self.models_dir, "*.pt")), key=os.path.getctime, reverse=True)
         self.available_models = [os.path.basename(f) for f in files]
-        if files and (self.loaded_model is None or self.current_model_name not in self.available_models):
-            self.load_ai_model(os.path.basename(files[0]))
+        
+        # Auto-load the newest model
+        if self.available_models:
+            if self.loaded_model is None or self.current_model_name not in self.available_models:
+                self.load_ai_model(self.available_models[0])
 
-    def load_ai_model(self, model_name: str):
-        path = os.path.join("saved_models", model_name)
-        if os.path.exists(path):
+    def load_ai_model(self, model_name: str) -> Tuple[bool, str]:
+        path = os.path.join(self.models_dir, model_name)
+        if not os.path.exists(path):
+            return False, f"File {model_name} not found."
+
+        try:
+            m = ActorCritic(state_dim=44)
             try:
-                m = ActorCritic(state_dim=44)
-                m.load_state_dict(torch.load(path, map_location="cpu", weights_only=False), strict=False)
-                m.eval()
-                self.loaded_model = m
-                self.current_model_name = model_name
-                self.ai_player.username = model_name
-                print(f"[Lobby] Loaded Neural Model for Player B: {model_name}")
-            except Exception as e:
-                print(f"[Lobby] Model load error: {e}")
+                state_dict = torch.load(path, map_location="cpu", weights_only=False)
+            except Exception:
+                state_dict = torch.load(path, map_location="cpu")
+
+            m.load_state_dict(state_dict, strict=False)
+            m.eval()
+            self.loaded_model = m
+            self.current_model_name = model_name
+            self.ai_player.username = model_name
+            print(f"[Lobby] Successfully loaded AI Model: {model_name}")
+            return True, ""
+        except Exception as e:
+            print(f"[Lobby] Failed to load model {model_name}: {e}")
+            return False, str(e)
 
     def get_canonical_features(self, pid: str) -> list:
         is_a = (pid == 'A')
@@ -207,7 +234,7 @@ class GameLobby:
     async def disconnect(self, ws: WebSocket):
         if ws in self.active_connections:
             p = self.active_connections.pop(ws)
-            print(f"[Lobby] Cleaned up session for {p.username}")
+            print(f"[Lobby] Session ended for {p.username}")
             self.running = False
             self.reset_arena()
 
@@ -223,21 +250,19 @@ class GameLobby:
                 pB.move()
             else:
                 pB = self.ai_player
-                # Pure Neural Model Inference
+                # Pure Neural Model Decision
                 if self.loaded_model:
                     feat_b = self.get_canonical_features('B')
                     tb = torch.tensor(feat_b, dtype=torch.float32).unsqueeze(0)
                     move_b = self.loaded_model.act(tb, deterministic=False)[0]
                     pB.move(move_b)
                 else:
-                    # Gentle patrol if no model loaded yet
-                    pB.move(1 if pB.x > 35 else 2)
+                    pB.move(0)
 
             pA.tick_cooldown()
             pB.tick_cooldown()
             pA.move()
 
-            # Auto-fire straight
             if pA.cooldown == 0:
                 self.bullets.append(Bullet(pA.x, pA.y, BULLET_SPEED, "A"))
                 pA.cooldown = FIRE_COOLDOWN
@@ -265,29 +290,36 @@ class GameLobby:
 
 lobby = GameLobby()
 
-# --- FAST BINARY HTTP UPLOAD ENDPOINT (NO 128KB LIMIT!) ---
+# --- RELIABLE DIRECT BINARY UPLOAD ENDPOINT ---
 @app.post("/api/upload_model")
-async def upload_model_binary(request: Request):
-    filename = request.headers.get("X-Filename", "uploaded_model.pt")
-    filename = os.path.basename(filename)
-    data = await request.body()
+async def upload_model_binary(request: Request, filename: Optional[str] = None):
+    try:
+        name = filename or request.headers.get("X-Filename") or "uploaded_model.pt"
+        name = os.path.basename(name)
 
-    os.makedirs("saved_models", exist_ok=True)
-    save_path = os.path.join("saved_models", filename)
-    with open(save_path, "wb") as f:
-        f.write(data)
+        data = await request.body()
+        if len(data) == 0:
+            return Response(content="Empty file payload received.", status_code=400)
 
-    lobby.refresh_available_models()
-    lobby.load_ai_model(filename)
+        save_path = os.path.join(lobby.models_dir, name)
+        with open(save_path, "wb") as f:
+            f.write(data)
 
-    await lobby.broadcast({
-        "type": "models_updated",
-        "models": lobby.available_models,
-        "selected_model": filename
-    })
-    await lobby.broadcast(lobby.get_current_state())
+        lobby.refresh_available_models()
+        success, err = lobby.load_ai_model(name)
+        if not success:
+            return Response(content=f"Saved file, but PyTorch failed to load model: {err}", status_code=500)
 
-    return {"status": "ok", "filename": filename, "models": lobby.available_models}
+        await lobby.broadcast({
+            "type": "models_updated",
+            "models": lobby.available_models,
+            "selected_model": name
+        })
+        await lobby.broadcast(lobby.get_current_state())
+
+        return {"status": "ok", "filename": name, "models": lobby.available_models}
+    except Exception as exc:
+        return Response(content=f"Server Exception: {exc}", status_code=500)
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -300,9 +332,7 @@ async def websocket_endpoint(ws: WebSocket):
         password = str(init_data.get("password", ""))
 
         if password != ROOM_PASSWORD:
-            remaining = lobby.register_failure(client_ip)
-            msg = f"Incorrect password. {remaining} attempt(s) remaining." if remaining > 0 else "Locked out for 15 minutes."
-            await ws.send_json({"type": "error", "message": msg})
+            await ws.send_json({"type": "error", "message": "Incorrect room password."})
             await ws.close(code=4002)
             return
 
@@ -311,7 +341,7 @@ async def websocket_endpoint(ws: WebSocket):
                 await lobby.disconnect(old_ws)
 
         if len(lobby.active_connections) >= 2:
-            await ws.send_json({"type": "error", "message": "Lobby is full (Maximum 2 players allowed)."})
+            await ws.send_json({"type": "error", "message": "Lobby is full (Maximum 2 players)."})
             await ws.close(code=4001)
             return
 

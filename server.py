@@ -6,7 +6,6 @@ import glob
 import asyncio
 from typing import Dict, Optional, Tuple
 
-# Ensure parent directory is in sys.path so model.py can always be imported
 sys.path.insert(0, os.path.abspath("."))
 sys.path.insert(0, os.path.abspath(".."))
 
@@ -39,7 +38,6 @@ app.add_middleware(
 failed_attempts: Dict[str, Dict] = {}
 
 def find_models_directory() -> str:
-    """Finds saved_models folder whether running from root or web_server/"""
     candidates = ["saved_models", "../saved_models", "../../saved_models"]
     for c in candidates:
         if os.path.isdir(c):
@@ -101,8 +99,8 @@ class GameLobby:
         self.solo_mode = True
 
         self.loaded_model = None
-        self.current_model_name = "No Model Found"
-        self.ai_player = Player("B", "Model", 25.0, 280.0, 200.0, 299.0)
+        self.current_model_name = "Waiting for Model..."
+        self.ai_player = Player("B", "Trained AI Model", 25.0, 280.0, 200.0, 299.0)
 
         self.refresh_available_models()
 
@@ -111,7 +109,6 @@ class GameLobby:
         files = sorted(glob.glob(os.path.join(self.models_dir, "*.pt")), key=os.path.getctime, reverse=True)
         self.available_models = [os.path.basename(f) for f in files]
         
-        # Auto-load the newest model
         if self.available_models:
             if self.loaded_model is None or self.current_model_name not in self.available_models:
                 self.load_ai_model(self.available_models[0])
@@ -133,10 +130,10 @@ class GameLobby:
             self.loaded_model = m
             self.current_model_name = model_name
             self.ai_player.username = model_name
-            print(f"[Lobby] Successfully loaded AI Model: {model_name}")
+            print(f"[Lobby] Loaded Neural Model: {model_name}")
             return True, ""
         except Exception as e:
-            print(f"[Lobby] Failed to load model {model_name}: {e}")
+            print(f"[Lobby] Failed to load {model_name}: {e}")
             return False, str(e)
 
     def get_canonical_features(self, pid: str) -> list:
@@ -250,7 +247,7 @@ class GameLobby:
                 pB.move()
             else:
                 pB = self.ai_player
-                # Pure Neural Model Decision
+                # Pure Neural Network Inference
                 if self.loaded_model:
                     feat_b = self.get_canonical_features('B')
                     tb = torch.tensor(feat_b, dtype=torch.float32).unsqueeze(0)
@@ -290,7 +287,7 @@ class GameLobby:
 
 lobby = GameLobby()
 
-# --- RELIABLE DIRECT BINARY UPLOAD ENDPOINT ---
+# HTTP Upload Endpoint
 @app.post("/api/upload_model")
 async def upload_model_binary(request: Request, filename: Optional[str] = None):
     try:
@@ -299,7 +296,7 @@ async def upload_model_binary(request: Request, filename: Optional[str] = None):
 
         data = await request.body()
         if len(data) == 0:
-            return Response(content="Empty file payload received.", status_code=400)
+            return Response(content="Empty file payload.", status_code=400)
 
         save_path = os.path.join(lobby.models_dir, name)
         with open(save_path, "wb") as f:
@@ -308,7 +305,7 @@ async def upload_model_binary(request: Request, filename: Optional[str] = None):
         lobby.refresh_available_models()
         success, err = lobby.load_ai_model(name)
         if not success:
-            return Response(content=f"Saved file, but PyTorch failed to load model: {err}", status_code=500)
+            return Response(content=f"Saved file, but PyTorch load failed: {err}", status_code=500)
 
         await lobby.broadcast({
             "type": "models_updated",
@@ -408,4 +405,5 @@ async def websocket_endpoint(ws: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("server:app", host="0.0.0.0", port=port)

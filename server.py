@@ -88,7 +88,6 @@ class Player:
         self.y_max = y_max
         self.score = 0
         self.cooldown = 0
-        self.ready = False
         self.keys = {"left": False, "right": False, "up": False, "down": False}
 
     def move(self, move_act: Optional[int] = None):
@@ -133,11 +132,10 @@ class GameLobby:
         self.bullets = []
         self.running = False
         self.loop_task: Optional[asyncio.Task] = None
-        self.solo_mode = False
 
         self.loaded_model = None
-        self.current_model_name = "Model (Loading...)"
-        self.ai_player = Player("B", "Model", 25.0, 280.0, 200.0, 299.0)
+        self.current_model_name = "imitation_model2.pt"
+        self.ai_player = Player("B", "imitation_model2.pt", 25.0, 280.0, 200.0, 299.0)
 
         self.refresh_available_models()
 
@@ -164,6 +162,7 @@ class GameLobby:
             self.loaded_model = m
             self.current_model_name = model_name
             self.ai_player.username = model_name
+            print(f"[Lobby] Loaded Neural Model: {model_name}")
             return True, ""
         except Exception as e:
             return False, str(e)
@@ -219,44 +218,36 @@ class GameLobby:
         if len(p_list) >= 1:
             p_list[0].x, p_list[0].y = 25.0, 20.0
             p_list[0].cooldown = 0
-            p_list[0].ready = False
+            p_list[0].score = 0
         if len(p_list) >= 2:
             p_list[1].x, p_list[1].y = 25.0, 280.0
             p_list[1].cooldown = 0
-            p_list[1].ready = False
+            p_list[1].score = 0
         self.ai_player.x, self.ai_player.y = 25.0, 280.0
         self.ai_player.cooldown = 0
+        self.ai_player.score = 0
 
     def get_current_state(self):
         p_list = list(self.active_connections.values())
         num_humans = len(p_list)
 
-        pA_name = p_list[0].username if num_humans >= 1 else "Waiting..."
-        pA_x = p_list[0].x if num_humans >= 1 else 25.0
-        pA_y = p_list[0].y if num_humans >= 1 else 20.0
-        pA_score = p_list[0].score if num_humans >= 1 else 0
-
-        # If 2 humans are present, Player B is HUMAN! If 1 human, Player B is MODEL.
-        if num_humans >= 2 and not self.solo_mode:
-            pB_name = p_list[1].username
-            pB_x = p_list[1].x
-            pB_y = p_list[1].y
-            pB_score = p_list[1].score
+        # 2 HUMANS CONNECTED = 100% PVP MODE!
+        if num_humans >= 2:
             is_pvp = True
+            pA = p_list[0]
+            pB = p_list[1]
         else:
-            pB_name = self.current_model_name
-            pB_x = self.ai_player.x
-            pB_y = self.ai_player.y
-            pB_score = self.ai_player.score
             is_pvp = False
+            pA = p_list[0] if num_humans == 1 else Player("A", "Waiting...", 25.0, 20.0, 0, 99)
+            pB = self.ai_player
 
         return {
             "type": "state",
             "is_pvp": is_pvp,
             "num_humans": num_humans,
             "running": self.running,
-            "player_a": {"x": pA_x, "y": pA_y, "score": pA_score, "name": pA_name},
-            "player_b": {"x": pB_x, "y": pB_y, "score": pB_score, "name": pB_name},
+            "player_a": {"x": pA.x, "y": pA.y, "score": pA.score, "name": pA.username},
+            "player_b": {"x": pB.x, "y": pB.y, "score": pB.score, "name": pB.username},
             "bullets": [{"x": b.x, "y": b.y, "owner": b.owner} for b in self.bullets]
         }
 
@@ -275,7 +266,6 @@ class GameLobby:
             p = self.active_connections.pop(ws)
             print(f"[Lobby] {p.username} disconnected.")
             self.running = False
-            self.solo_mode = False
             self.reset_arena()
             await self.broadcast(self.get_current_state())
 
@@ -286,12 +276,12 @@ class GameLobby:
                 break
 
             pA = p_list[0]
-            
-            # --- 2-PLAYER HUMAN DUEL ---
-            if len(p_list) >= 2 and not self.solo_mode:
+
+            # 2-PLAYER HUMAN PVP
+            if len(p_list) >= 2:
                 pB = p_list[1]
-                pB.move()  # Player 2 moves with their own physical keyboard!
-            # --- 1-PLAYER SOLO VS MODEL ---
+                pB.move()  # Player 2 moves with their own keyboard
+            # 1-PLAYER SOLO VS MODEL
             else:
                 pB = self.ai_player
                 if self.loaded_model:
@@ -304,7 +294,7 @@ class GameLobby:
 
             pA.tick_cooldown()
             pB.tick_cooldown()
-            pA.move()  # Player 1 moves with their own physical keyboard!
+            pA.move()  # Player 1 moves with their own keyboard
 
             # Both auto-shoot on cooldown
             if pA.cooldown == 0:
@@ -337,7 +327,6 @@ lobby = GameLobby()
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-    client_ip = ws.client.host if ws.client else "unknown"
 
     try:
         init_data = await ws.receive_json()
@@ -349,88 +338,9 @@ async def websocket_endpoint(ws: WebSocket):
             await ws.close(code=4002)
             return
 
-        # Clean up stale session if same name re-logged in
+        # Replace stale session if same name re-connected
         for old_ws, old_p in list(lobby.active_connections.items()):
             if old_p.username == username:
                 await lobby.disconnect(old_ws)
 
-        if len(lobby.active_connections) >= 2:
-            await ws.send_json({"type": "error", "message": "Lobby is full (Maximum 2 players allowed)."})
-            await ws.close(code=4001)
-            return
-
-        assigned_id = "A" if len(lobby.active_connections) == 0 else "B"
-        player = Player(assigned_id, username, 25.0, 20.0 if assigned_id == "A" else 280.0, 
-                        0.0 if assigned_id == "A" else 200.0, 
-                        99.0 if assigned_id == "A" else 299.0)
-
-        lobby.active_connections[ws] = player
-        lobby.refresh_available_models()
-
-        # Send welcome init packet
-        await ws.send_json({
-            "type": "init",
-            "slot": assigned_id,
-            "username": username,
-            "models": lobby.available_models,
-            "selected_model": lobby.current_model_name
-        })
-
-        # Broadcast state so both screens update immediately
-        await lobby.broadcast(lobby.get_current_state())
-
-        while True:
-            msg = await ws.receive_json()
-            mtype = msg.get("type")
-
-            if mtype == "ping":
-                await ws.send_json({"type": "pong"})
-
-            elif mtype == "select_model":
-                m_name = msg.get("model")
-                lobby.load_ai_model(m_name)
-                await lobby.broadcast(lobby.get_current_state())
-
-            # 2-PLAYER READY DUEL TRIGGER
-            elif mtype == "ready_duel":
-                player.ready = True
-                p_list = list(lobby.active_connections.values())
-                # If both humans are ready (or either clicks ready): Start the 2-Player Match!
-                if len(p_list) == 2:
-                    lobby.solo_mode = False
-                    lobby.running = True
-                    lobby.reset_arena()
-                    if lobby.loop_task is None or lobby.loop_task.done():
-                        lobby.loop_task = asyncio.create_task(lobby.game_tick())
-
-            # 1-PLAYER SOLO VS MODEL TRIGGER
-            elif mtype == "start_solo":
-                lobby.solo_mode = True
-                lobby.running = True
-                lobby.reset_arena()
-                if lobby.loop_task is None or lobby.loop_task.done():
-                    lobby.loop_task = asyncio.create_task(lobby.game_tick())
-
-            elif mtype == "stop_match":
-                lobby.running = False
-                lobby.reset_arena()
-                await lobby.broadcast(lobby.get_current_state())
-
-            elif mtype == "keys":
-                player.keys = {
-                    "left": bool(msg.get("left", False)),
-                    "right": bool(msg.get("right", False)),
-                    "up": bool(msg.get("up", False)),
-                    "down": bool(msg.get("down", False))
-                }
-
-    except WebSocketDisconnect:
-        await lobby.disconnect(ws)
-    except Exception as e:
-        print(f"[Error] {e}")
-        await lobby.disconnect(ws)
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("server:app", host="0.0.0.0", port=port)
+        if len(lobby.active_connections) >=

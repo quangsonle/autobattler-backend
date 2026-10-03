@@ -6,6 +6,9 @@ import glob
 import asyncio
 from typing import Dict, Optional, Tuple
 
+sys.path.insert(0, os.path.abspath("."))
+sys.path.insert(0, os.path.abspath(".."))
+
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import torch
@@ -128,7 +131,10 @@ class GameLobby:
         self.models_dir = os.path.join(base_dir, "saved_models")
         os.makedirs(self.models_dir, exist_ok=True)
 
-        self.active_connections: Dict[WebSocket, Player] = {}
+        # Dedicated Slots: Slot A and Slot B
+        self.slot_a: Optional[Tuple[WebSocket, Player]] = None
+        self.slot_b: Optional[Tuple[WebSocket, Player]] = None
+
         self.bullets = []
         self.running = False
         self.loop_task: Optional[asyncio.Task] = None
@@ -169,9 +175,11 @@ class GameLobby:
 
     def get_canonical_features(self, pid: str) -> list:
         is_a = (pid == 'A')
-        p_list = list(self.active_connections.values())
-        self_p = p_list[0] if is_a else self.ai_player
-        rival_p = self.ai_player if is_a else (p_list[0] if len(p_list) >= 1 else self.ai_player)
+        pA = self.slot_a[1] if self.slot_a else Player("A", "", 25, 20, 0, 99)
+        pB = self.slot_b[1] if self.slot_b else self.ai_player
+
+        self_p = pA if is_a else pB
+        rival_p = pB if is_a else pA
 
         def to_canonical(x, y, vy):
             return (x, y, vy) if is_a else (x, MAP_HEIGHT - 1.0 - y, -vy)
@@ -212,34 +220,26 @@ class GameLobby:
 
         return features
 
-    def reset_arena(self):
+    def reset_positions_and_scores(self):
         self.bullets.clear()
-        p_list = list(self.active_connections.values())
-        if len(p_list) >= 1:
-            p_list[0].x, p_list[0].y = 25.0, 20.0
-            p_list[0].cooldown = 0
-            p_list[0].score = 0
-        if len(p_list) >= 2:
-            p_list[1].x, p_list[1].y = 25.0, 280.0
-            p_list[1].cooldown = 0
-            p_list[1].score = 0
+        if self.slot_a:
+            self.slot_a[1].x, self.slot_a[1].y = 25.0, 20.0
+            self.slot_a[1].cooldown = 0
+            self.slot_a[1].score = 0
+        if self.slot_b:
+            self.slot_b[1].x, self.slot_b[1].y = 25.0, 280.0
+            self.slot_b[1].cooldown = 0
+            self.slot_b[1].score = 0
         self.ai_player.x, self.ai_player.y = 25.0, 280.0
         self.ai_player.cooldown = 0
         self.ai_player.score = 0
 
     def get_current_state(self):
-        p_list = list(self.active_connections.values())
-        num_humans = len(p_list)
+        num_humans = (1 if self.slot_a else 0) + (1 if self.slot_b else 0)
+        is_pvp = (num_humans == 2)
 
-        # 2 HUMANS CONNECTED = 100% PVP MODE!
-        if num_humans >= 2:
-            is_pvp = True
-            pA = p_list[0]
-            pB = p_list[1]
-        else:
-            is_pvp = False
-            pA = p_list[0] if num_humans == 1 else Player("A", "Waiting...", 25.0, 20.0, 0, 99)
-            pB = self.ai_player
+        pA = self.slot_a[1] if self.slot_a else Player("A", "Waiting...", 25.0, 20.0, 0, 99)
+        pB = self.slot_b[1] if self.slot_b else self.ai_player
 
         return {
             "type": "state",
@@ -252,8 +252,12 @@ class GameLobby:
         }
 
     async def broadcast(self, data: dict):
+        targets = []
+        if self.slot_a: targets.append(self.slot_a[0])
+        if self.slot_b: targets.append(self.slot_b[0])
+
         dead = []
-        for ws in list(self.active_connections.keys()):
+        for ws in targets:
             try:
                 await ws.send_json(data)
             except Exception:
@@ -262,26 +266,29 @@ class GameLobby:
             await self.disconnect(ws)
 
     async def disconnect(self, ws: WebSocket):
-        if ws in self.active_connections:
-            p = self.active_connections.pop(ws)
-            print(f"[Lobby] {p.username} disconnected.")
-            self.running = False
-            self.reset_arena()
-            await self.broadcast(self.get_current_state())
+        if self.slot_a and self.slot_a[0] == ws:
+            print(f"[Lobby] Slot A ({self.slot_a[1].username}) left.")
+            self.slot_a = None
+        elif self.slot_b and self.slot_b[0] == ws:
+            print(f"[Lobby] Slot B ({self.slot_b[1].username}) left.")
+            self.slot_b = None
+
+        self.running = False
+        self.reset_positions_and_scores()
+        await self.broadcast(self.get_current_state())
 
     async def game_tick(self):
         while self.running:
-            p_list = list(self.active_connections.values())
-            if len(p_list) == 0:
+            if not self.slot_a and not self.slot_b:
                 break
 
-            pA = p_list[0]
-
-            # 2-PLAYER HUMAN PVP
-            if len(p_list) >= 2:
-                pB = p_list[1]
-                pB.move()  # Player 2 moves with their own keyboard
-            # 1-PLAYER SOLO VS MODEL
+            pA = self.slot_a[1] if self.slot_a else self.ai_player
+            
+            # PVP DUEL
+            if self.slot_a and self.slot_b:
+                pB = self.slot_b[1]
+                pB.move()  # Player B moves with keyboard
+            # SOLO VS MODEL
             else:
                 pB = self.ai_player
                 if self.loaded_model:
@@ -294,9 +301,9 @@ class GameLobby:
 
             pA.tick_cooldown()
             pB.tick_cooldown()
-            pA.move()  # Player 1 moves with their own keyboard
+            pA.move()  # Player A moves with keyboard
 
-            # Both auto-shoot on cooldown
+            # Auto-fire straight on cooldown
             if pA.cooldown == 0:
                 self.bullets.append(Bullet(pA.x, pA.y, BULLET_SPEED, "A"))
                 pA.cooldown = FIRE_COOLDOWN
@@ -338,9 +345,76 @@ async def websocket_endpoint(ws: WebSocket):
             await ws.close(code=4002)
             return
 
-        # Replace stale session if same name re-connected
-        for old_ws, old_p in list(lobby.active_connections.items()):
-            if old_p.username == username:
-                await lobby.disconnect(old_ws)
+        # Assign Slot A first; if taken, assign Slot B!
+        if lobby.slot_a is None:
+            assigned_slot = "A"
+            player = Player("A", username, 25.0, 20.0, 0.0, 99.0)
+            lobby.slot_a = (ws, player)
+        elif lobby.slot_b is None:
+            assigned_slot = "B"
+            player = Player("B", username, 25.0, 280.0, 200.0, 299.0)
+            lobby.slot_b = (ws, player)
+        else:
+            await ws.send_json({"type": "error", "message": "Lobby is full (Maximum 2 players)."})
+            await ws.close(code=4001)
+            return
 
-        if len(lobby.active_connections) >=
+        print(f"[Lobby] Assigned {username} to Slot {assigned_slot}. (Slot A: {bool(lobby.slot_a)}, Slot B: {bool(lobby.slot_b)})")
+
+        # Stop match and reset scores cleanly whenever someone joins
+        lobby.running = False
+        lobby.reset_positions_and_scores()
+
+        await ws.send_json({
+            "type": "init",
+            "slot": assigned_slot,
+            "username": username,
+            "models": lobby.available_models,
+            "selected_model": lobby.current_model_name
+        })
+
+        # Broadcast state so BOTH screens update immediately!
+        await lobby.broadcast(lobby.get_current_state())
+
+        while True:
+            msg = await ws.receive_json()
+            mtype = msg.get("type")
+
+            if mtype == "ping":
+                await ws.send_json({"type": "pong"})
+
+            elif mtype == "select_model":
+                m_name = msg.get("model")
+                lobby.load_ai_model(m_name)
+                await lobby.broadcast(lobby.get_current_state())
+
+            # Start Match (Works for both 2-Player Duel and Solo)
+            elif mtype in ["start_match", "start_solo", "start_duel"]:
+                lobby.running = True
+                lobby.reset_positions_and_scores()
+                if lobby.loop_task is None or lobby.loop_task.done():
+                    lobby.loop_task = asyncio.create_task(lobby.game_tick())
+
+            elif mtype == "stop_match":
+                lobby.running = False
+                lobby.reset_positions_and_scores()
+                await lobby.broadcast(lobby.get_current_state())
+
+            elif mtype == "keys":
+                player.keys = {
+                    "left": bool(msg.get("left", False)),
+                    "right": bool(msg.get("right", False)),
+                    "up": bool(msg.get("up", False)),
+                    "down": bool(msg.get("down", False))
+                }
+
+    except WebSocketDisconnect:
+        await lobby.disconnect(ws)
+    except Exception as e:
+        print(f"[Error] {e}")
+        await lobby.disconnect(ws)
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("server:app", host="0.0.0.0", port=port)

@@ -24,7 +24,7 @@ BULLET_SPEED = 50.0 / TPS
 FIRE_COOLDOWN = int(0.5 * TPS)
 HITBOX_RADIUS = 1.6
 
-# --- SELF-CONTAINED NEURAL NETWORK (NO MODEL.PY NEEDED!) ---
+# Self-contained Neural Network (No external model.py required on Render)
 class ActorCritic(nn.Module):
     def __init__(self, state_dim=44):
         super().__init__()
@@ -70,6 +70,14 @@ app.add_middleware(
 
 failed_attempts: Dict[str, Dict] = {}
 
+def find_models_directory() -> str:
+    candidates = ["saved_models", "../saved_models", "../../saved_models"]
+    for c in candidates:
+        if os.path.isdir(c):
+            return os.path.abspath(c)
+    os.makedirs("saved_models", exist_ok=True)
+    return os.path.abspath("saved_models")
+
 class Player:
     def __init__(self, pid: str, username: str, x: float, y: float, y_min: float, y_max: float):
         self.pid = pid
@@ -80,6 +88,7 @@ class Player:
         self.y_max = y_max
         self.score = 0
         self.cooldown = 0
+        self.ready = False
         self.keys = {"left": False, "right": False, "up": False, "down": False}
 
     def move(self, move_act: Optional[int] = None):
@@ -116,7 +125,6 @@ class Bullet:
 
 class GameLobby:
     def __init__(self):
-        # Look for saved_models in current repo root
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.models_dir = os.path.join(base_dir, "saved_models")
         os.makedirs(self.models_dir, exist_ok=True)
@@ -125,10 +133,10 @@ class GameLobby:
         self.bullets = []
         self.running = False
         self.loop_task: Optional[asyncio.Task] = None
-        self.solo_mode = True
+        self.solo_mode = False
 
         self.loaded_model = None
-        self.current_model_name = "Waiting for Model..."
+        self.current_model_name = "Model (Loading...)"
         self.ai_player = Player("B", "Model", 25.0, 280.0, 200.0, 299.0)
 
         self.refresh_available_models()
@@ -136,8 +144,6 @@ class GameLobby:
     def refresh_available_models(self):
         files = sorted(glob.glob(os.path.join(self.models_dir, "*.pt")), key=os.path.getctime, reverse=True)
         self.available_models = [os.path.basename(f) for f in files]
-        print(f"[Lobby] Found {len(self.available_models)} models in {self.models_dir}: {self.available_models}")
-
         if self.available_models:
             self.load_ai_model(self.available_models[0])
 
@@ -158,10 +164,8 @@ class GameLobby:
             self.loaded_model = m
             self.current_model_name = model_name
             self.ai_player.username = model_name
-            print(f"[Lobby] Successfully loaded AI Model: {model_name}")
             return True, ""
         except Exception as e:
-            print(f"[Lobby] Failed to load model {model_name}: {e}")
             return False, str(e)
 
     def get_canonical_features(self, pid: str) -> list:
@@ -215,32 +219,42 @@ class GameLobby:
         if len(p_list) >= 1:
             p_list[0].x, p_list[0].y = 25.0, 20.0
             p_list[0].cooldown = 0
+            p_list[0].ready = False
         if len(p_list) >= 2:
             p_list[1].x, p_list[1].y = 25.0, 280.0
             p_list[1].cooldown = 0
+            p_list[1].ready = False
         self.ai_player.x, self.ai_player.y = 25.0, 280.0
         self.ai_player.cooldown = 0
 
     def get_current_state(self):
         p_list = list(self.active_connections.values())
-        pA_name = p_list[0].username if len(p_list) >= 1 else "Waiting..."
-        pA_x = p_list[0].x if len(p_list) >= 1 else 25.0
-        pA_y = p_list[0].y if len(p_list) >= 1 else 20.0
-        pA_score = p_list[0].score if len(p_list) >= 1 else 0
+        num_humans = len(p_list)
 
-        if len(p_list) >= 2 and not self.solo_mode:
+        pA_name = p_list[0].username if num_humans >= 1 else "Waiting..."
+        pA_x = p_list[0].x if num_humans >= 1 else 25.0
+        pA_y = p_list[0].y if num_humans >= 1 else 20.0
+        pA_score = p_list[0].score if num_humans >= 1 else 0
+
+        # If 2 humans are present, Player B is HUMAN! If 1 human, Player B is MODEL.
+        if num_humans >= 2 and not self.solo_mode:
             pB_name = p_list[1].username
             pB_x = p_list[1].x
             pB_y = p_list[1].y
             pB_score = p_list[1].score
+            is_pvp = True
         else:
             pB_name = self.current_model_name
             pB_x = self.ai_player.x
             pB_y = self.ai_player.y
             pB_score = self.ai_player.score
+            is_pvp = False
 
         return {
             "type": "state",
+            "is_pvp": is_pvp,
+            "num_humans": num_humans,
+            "running": self.running,
             "player_a": {"x": pA_x, "y": pA_y, "score": pA_score, "name": pA_name},
             "player_b": {"x": pB_x, "y": pB_y, "score": pB_score, "name": pB_name},
             "bullets": [{"x": b.x, "y": b.y, "owner": b.owner} for b in self.bullets]
@@ -259,9 +273,11 @@ class GameLobby:
     async def disconnect(self, ws: WebSocket):
         if ws in self.active_connections:
             p = self.active_connections.pop(ws)
-            print(f"[Lobby] Session ended for {p.username}")
+            print(f"[Lobby] {p.username} disconnected.")
             self.running = False
+            self.solo_mode = False
             self.reset_arena()
+            await self.broadcast(self.get_current_state())
 
     async def game_tick(self):
         while self.running:
@@ -270,9 +286,12 @@ class GameLobby:
                 break
 
             pA = p_list[0]
+            
+            # --- 2-PLAYER HUMAN DUEL ---
             if len(p_list) >= 2 and not self.solo_mode:
                 pB = p_list[1]
-                pB.move()
+                pB.move()  # Player 2 moves with their own physical keyboard!
+            # --- 1-PLAYER SOLO VS MODEL ---
             else:
                 pB = self.ai_player
                 if self.loaded_model:
@@ -285,8 +304,9 @@ class GameLobby:
 
             pA.tick_cooldown()
             pB.tick_cooldown()
-            pA.move()
+            pA.move()  # Player 1 moves with their own physical keyboard!
 
+            # Both auto-shoot on cooldown
             if pA.cooldown == 0:
                 self.bullets.append(Bullet(pA.x, pA.y, BULLET_SPEED, "A"))
                 pA.cooldown = FIRE_COOLDOWN
@@ -314,36 +334,6 @@ class GameLobby:
 
 lobby = GameLobby()
 
-@app.post("/api/upload_model")
-async def upload_model_binary(request: Request, filename: Optional[str] = None):
-    try:
-        name = filename or request.headers.get("X-Filename") or "uploaded_model.pt"
-        name = os.path.basename(name)
-
-        data = await request.body()
-        if len(data) == 0:
-            return Response(content="Empty file payload.", status_code=400)
-
-        save_path = os.path.join(lobby.models_dir, name)
-        with open(save_path, "wb") as f:
-            f.write(data)
-
-        lobby.refresh_available_models()
-        success, err = lobby.load_ai_model(name)
-        if not success:
-            return Response(content=f"Saved file, but load failed: {err}", status_code=500)
-
-        await lobby.broadcast({
-            "type": "models_updated",
-            "models": lobby.available_models,
-            "selected_model": name
-        })
-        await lobby.broadcast(lobby.get_current_state())
-
-        return {"status": "ok", "filename": name, "models": lobby.available_models}
-    except Exception as exc:
-        return Response(content=f"Server Exception: {exc}", status_code=500)
-
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -359,12 +349,13 @@ async def websocket_endpoint(ws: WebSocket):
             await ws.close(code=4002)
             return
 
+        # Clean up stale session if same name re-logged in
         for old_ws, old_p in list(lobby.active_connections.items()):
             if old_p.username == username:
                 await lobby.disconnect(old_ws)
 
         if len(lobby.active_connections) >= 2:
-            await ws.send_json({"type": "error", "message": "Lobby is full (Maximum 2 players)."})
+            await ws.send_json({"type": "error", "message": "Lobby is full (Maximum 2 players allowed)."})
             await ws.close(code=4001)
             return
 
@@ -376,7 +367,7 @@ async def websocket_endpoint(ws: WebSocket):
         lobby.active_connections[ws] = player
         lobby.refresh_available_models()
 
-        # Send models list & active model immediately
+        # Send welcome init packet
         await ws.send_json({
             "type": "init",
             "slot": assigned_id,
@@ -385,6 +376,7 @@ async def websocket_endpoint(ws: WebSocket):
             "selected_model": lobby.current_model_name
         })
 
+        # Broadcast state so both screens update immediately
         await lobby.broadcast(lobby.get_current_state())
 
         while True:
@@ -397,14 +389,22 @@ async def websocket_endpoint(ws: WebSocket):
             elif mtype == "select_model":
                 m_name = msg.get("model")
                 lobby.load_ai_model(m_name)
-                await lobby.broadcast({
-                    "type": "models_updated",
-                    "models": lobby.available_models,
-                    "selected_model": lobby.current_model_name
-                })
                 await lobby.broadcast(lobby.get_current_state())
 
-            elif mtype == "start_match":
+            # 2-PLAYER READY DUEL TRIGGER
+            elif mtype == "ready_duel":
+                player.ready = True
+                p_list = list(lobby.active_connections.values())
+                # If both humans are ready (or either clicks ready): Start the 2-Player Match!
+                if len(p_list) == 2:
+                    lobby.solo_mode = False
+                    lobby.running = True
+                    lobby.reset_arena()
+                    if lobby.loop_task is None or lobby.loop_task.done():
+                        lobby.loop_task = asyncio.create_task(lobby.game_tick())
+
+            # 1-PLAYER SOLO VS MODEL TRIGGER
+            elif mtype == "start_solo":
                 lobby.solo_mode = True
                 lobby.running = True
                 lobby.reset_arena()

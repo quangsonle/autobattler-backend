@@ -116,8 +116,8 @@ class GameLobby:
                 m.eval()
                 self.loaded_model = m
                 self.ai_bot_type = model_name
-                self.ai_player.username = model_name[:14]
-                print(f"[Lobby] Loaded Neural Model: {model_name}")
+                self.ai_player.username = model_name  # Keep full name!
+                print(f"[Lobby] Successfully loaded model: {model_name}")
             except Exception as e:
                 print(f"[Lobby] Model load error: {e}")
 
@@ -232,7 +232,6 @@ class GameLobby:
                 pB.move()
             else:
                 pB = self.ai_player
-                # Run Neural Network or Greedy AI
                 if self.loaded_model:
                     feat_b = self.get_canonical_features('B')
                     tb = torch.tensor(feat_b, dtype=torch.float32).unsqueeze(0)
@@ -252,7 +251,7 @@ class GameLobby:
             pB.tick_cooldown()
             pA.move()
 
-            # Auto-fire straight forward
+            # Auto-fire straight
             if pA.cooldown == 0:
                 self.bullets.append(Bullet(pA.x, pA.y, BULLET_SPEED, "A"))
                 pA.cooldown = FIRE_COOLDOWN
@@ -297,7 +296,6 @@ async def websocket_endpoint(ws: WebSocket):
             await ws.close(code=4002)
             return
 
-        # Ghost session cleanup: If you reconnected, drop the old socket silently!
         for old_ws, old_p in list(lobby.active_connections.items()):
             if old_p.username == username:
                 await lobby.disconnect(old_ws)
@@ -313,17 +311,16 @@ async def websocket_endpoint(ws: WebSocket):
                         99.0 if assigned_id == "A" else 299.0)
 
         lobby.active_connections[ws] = player
-
         lobby.refresh_available_models()
+
         await ws.send_json({
             "type": "init",
             "slot": assigned_id,
             "username": username,
             "models": lobby.available_models,
-            "selected_model": lobby.ai_player.username
+            "selected_model": lobby.ai_bot_type
         })
 
-        # Immediately draw arena and players
         await lobby.broadcast(lobby.get_current_state())
 
         while True:
@@ -336,20 +333,30 @@ async def websocket_endpoint(ws: WebSocket):
             elif mtype == "select_model":
                 m_name = msg.get("model")
                 lobby.load_ai_model(m_name)
+                await ws.send_json({
+                    "type": "model_ready",
+                    "model": lobby.ai_bot_type,
+                    "message": f"Opponent set to: {lobby.ai_bot_type}"
+                })
                 await lobby.broadcast(lobby.get_current_state())
 
             elif mtype == "upload_model":
                 filename = os.path.basename(msg.get("filename", "custom_model.pt"))
                 file_bytes = base64.b64decode(msg.get("data"))
+                os.makedirs("saved_models", exist_ok=True)
                 save_dest = os.path.join("saved_models", filename)
                 with open(save_dest, "wb") as f:
                     f.write(file_bytes)
+                
                 lobby.refresh_available_models()
                 lobby.load_ai_model(filename)
-                await lobby.broadcast({
-                    "type": "models_updated",
+                
+                # Send confirmation immediately!
+                await ws.send_json({
+                    "type": "upload_success",
                     "models": lobby.available_models,
-                    "selected_model": lobby.ai_player.username
+                    "selected_model": filename,
+                    "message": f"Upload Complete! Loaded: {filename}"
                 })
                 await lobby.broadcast(lobby.get_current_state())
 

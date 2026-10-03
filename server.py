@@ -86,8 +86,7 @@ class GameLobby:
         self.loop_task: Optional[asyncio.Task] = None
         self.solo_mode = True
         
-        # AI Opponent Setup
-        self.ai_bot_type = "greedy"  # "greedy" or filename
+        self.ai_bot_type = "Greedy AI"
         self.greedy_bot = GreedyAI('B')
         self.loaded_model = None
         self.ai_player = Player("B", "Greedy AI", 25.0, 280.0, 200.0, 299.0)
@@ -98,16 +97,15 @@ class GameLobby:
         os.makedirs("saved_models", exist_ok=True)
         files = sorted(glob.glob("saved_models/*.pt"), key=os.path.getctime, reverse=True)
         self.available_models = ["Greedy AI"] + [os.path.basename(f) for f in files]
-        # Auto-load newest model if exists
-        if files:
+        if files and self.loaded_model is None:
             self.load_ai_model(os.path.basename(files[0]))
 
     def load_ai_model(self, model_name: str):
         if model_name == "Greedy AI":
-            self.ai_bot_type = "greedy"
+            self.ai_bot_type = "Greedy AI"
             self.loaded_model = None
             self.ai_player.username = "Greedy AI"
-            print("[Lobby] Loaded Greedy AI for Player B")
+            print("[Lobby] Switched to Greedy AI.")
             return
 
         path = os.path.join("saved_models", model_name)
@@ -121,12 +119,13 @@ class GameLobby:
                 self.ai_player.username = model_name[:14]
                 print(f"[Lobby] Loaded Neural Model: {model_name}")
             except Exception as e:
-                print(f"[Lobby] Failed to load {model_name}: {e}")
+                print(f"[Lobby] Model load error: {e}")
 
     def get_canonical_features(self, pid: str) -> list:
         is_a = (pid == 'A')
-        self_p = list(self.active_connections.values())[0] if is_a else self.ai_player
-        rival_p = self.ai_player if is_a else list(self.active_connections.values())[0]
+        p_list = list(self.active_connections.values())
+        self_p = p_list[0] if is_a else self.ai_player
+        rival_p = self.ai_player if is_a else (p_list[0] if len(p_list) >= 1 else self.ai_player)
 
         def to_canonical(x, y, vy):
             return (x, y, vy) if is_a else (x, MAP_HEIGHT - 1.0 - y, -vy)
@@ -181,19 +180,32 @@ class GameLobby:
 
     def get_current_state(self):
         p_list = list(self.active_connections.values())
-        pA = p_list[0] if len(p_list) >= 1 else Player("A", "Waiting...", 25.0, 20.0, 0, 99)
-        pB = p_list[1] if (len(p_list) >= 2 and not self.solo_mode) else self.ai_player
+        pA_name = p_list[0].username if len(p_list) >= 1 else "Waiting..."
+        pA_x = p_list[0].x if len(p_list) >= 1 else 25.0
+        pA_y = p_list[0].y if len(p_list) >= 1 else 20.0
+        pA_score = p_list[0].score if len(p_list) >= 1 else 0
+
+        if len(p_list) >= 2 and not self.solo_mode:
+            pB_name = p_list[1].username
+            pB_x = p_list[1].x
+            pB_y = p_list[1].y
+            pB_score = p_list[1].score
+        else:
+            pB_name = self.ai_player.username
+            pB_x = self.ai_player.x
+            pB_y = self.ai_player.y
+            pB_score = self.ai_player.score
 
         return {
             "type": "state",
-            "player_a": {"x": pA.x, "y": pA.y, "score": pA.score, "name": pA.username},
-            "player_b": {"x": pB.x, "y": pB.y, "score": pB.score, "name": pB.username},
+            "player_a": {"x": pA_x, "y": pA_y, "score": pA_score, "name": pA_name},
+            "player_b": {"x": pB_x, "y": pB_y, "score": pB_score, "name": pB_name},
             "bullets": [{"x": b.x, "y": b.y, "owner": b.owner} for b in self.bullets]
         }
 
     async def broadcast(self, data: dict):
         dead = []
-        for ws in self.active_connections.keys():
+        for ws in list(self.active_connections.keys()):
             try:
                 await ws.send_json(data)
             except Exception:
@@ -204,14 +216,9 @@ class GameLobby:
     async def disconnect(self, ws: WebSocket):
         if ws in self.active_connections:
             p = self.active_connections.pop(ws)
-            print(f"[Lobby] {p.username} disconnected.")
+            print(f"[Lobby] Cleaned up session for {p.username}")
             self.running = False
             self.reset_arena()
-            await self.broadcast({
-                "type": "player_left",
-                "message": f"{p.username} left."
-            })
-            await self.broadcast(self.get_current_state())
 
     async def game_tick(self):
         while self.running:
@@ -225,14 +232,13 @@ class GameLobby:
                 pB.move()
             else:
                 pB = self.ai_player
-                # Run REAL Neural Network Inference for Player B
+                # Run Neural Network or Greedy AI
                 if self.loaded_model:
                     feat_b = self.get_canonical_features('B')
                     tb = torch.tensor(feat_b, dtype=torch.float32).unsqueeze(0)
                     move_b = self.loaded_model.act(tb, deterministic=False)[0]
                     pB.move(move_b)
                 else:
-                    # Fallback to Greedy AI
                     class MockEngine:
                         def __init__(self, pA, pB, bullets):
                             self.player_a = pA
@@ -246,7 +252,7 @@ class GameLobby:
             pB.tick_cooldown()
             pA.move()
 
-            # Auto-fire straight
+            # Auto-fire straight forward
             if pA.cooldown == 0:
                 self.bullets.append(Bullet(pA.x, pA.y, BULLET_SPEED, "A"))
                 pA.cooldown = FIRE_COOLDOWN
@@ -279,27 +285,6 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     client_ip = ws.client.host if ws.client else "unknown"
 
-    if lobby.is_locked_out(client_ip):
-        await ws.send_json({"type": "error", "message": "Too many failed attempts. Locked out for 15 minutes."})
-        await ws.close(code=4003)
-        return
-
-    # If lobby is full, check if any socket is dead before rejecting
-    if len(lobby.active_connections) >= 2:
-        dead = []
-        for active_ws in list(lobby.active_connections.keys()):
-            try:
-                await active_ws.send_json({"type": "ping"})
-            except Exception:
-                dead.append(active_ws)
-        for d in dead:
-            await lobby.disconnect(d)
-
-    if len(lobby.active_connections) >= 2:
-        await ws.send_json({"type": "error", "message": "Lobby is full (Maximum 2 players allowed)."})
-        await ws.close(code=4001)
-        return
-
     try:
         init_data = await ws.receive_json()
         username = str(init_data.get("username", "")).strip()[:14] or "Player"
@@ -310,6 +295,16 @@ async def websocket_endpoint(ws: WebSocket):
             msg = f"Incorrect password. {remaining} attempt(s) remaining." if remaining > 0 else "Locked out for 15 minutes."
             await ws.send_json({"type": "error", "message": msg})
             await ws.close(code=4002)
+            return
+
+        # Ghost session cleanup: If you reconnected, drop the old socket silently!
+        for old_ws, old_p in list(lobby.active_connections.items()):
+            if old_p.username == username:
+                await lobby.disconnect(old_ws)
+
+        if len(lobby.active_connections) >= 2:
+            await ws.send_json({"type": "error", "message": "Lobby is full (Maximum 2 players allowed)."})
+            await ws.close(code=4001)
             return
 
         assigned_id = "A" if len(lobby.active_connections) == 0 else "B"
@@ -328,7 +323,7 @@ async def websocket_endpoint(ws: WebSocket):
             "selected_model": lobby.ai_player.username
         })
 
-        # Immediately draw arena and send current state
+        # Immediately draw arena and players
         await lobby.broadcast(lobby.get_current_state())
 
         while True:
@@ -359,8 +354,7 @@ async def websocket_endpoint(ws: WebSocket):
                 await lobby.broadcast(lobby.get_current_state())
 
             elif mtype == "start_match":
-                is_solo = bool(msg.get("solo", True))
-                lobby.solo_mode = is_solo
+                lobby.solo_mode = True
                 lobby.running = True
                 lobby.reset_arena()
                 if lobby.loop_task is None or lobby.loop_task.done():
